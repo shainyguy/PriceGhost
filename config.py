@@ -34,15 +34,25 @@ class DatabaseConfig:
 
 @dataclass
 class WebhookConfig:
-    url: str = os.getenv("WEBHOOK_URL", "")
+    url: str = os.getenv("WEBHOOK_URL", "").rstrip("/")
     path: str = os.getenv("WEBHOOK_PATH", "/webhook")
     host: str = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
     port: int = int(os.getenv("WEB_SERVER_PORT", "8080"))
 
+    def __post_init__(self):
+        # Гарантируем чистые пути
+        self.url = self.url.rstrip("/")
+        if self.path and not self.path.startswith("/"):
+            self.path = "/" + self.path
+        self.path = "/" + self.path.strip("/")
+
+    @property
+    def full_url(self) -> str:
+        return f"{self.url}{self.path}"
+
 
 @dataclass
 class PlanLimits:
-    """Лимиты для каждого плана"""
     FREE = {
         "checks_per_day": 3,
         "history_days": 30,
