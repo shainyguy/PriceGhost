@@ -37,10 +37,7 @@ async def _fetch(url: str) -> Optional[str]:
                 logger.info(f"  -> {r.status}")
                 if r.status == 200:
                     return await r.text()
-                else:
-                    body = await r.text()
-                    logger.warning(f"  -> body: {body[:150]}")
-                    return None
+                return None
     except Exception as e:
         logger.error(f"  -> ERROR: {e}")
         return None
@@ -52,87 +49,89 @@ async def _fetch_json(url: str) -> Any:
         return None
     try:
         return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"  -> JSON error: {e}, body: {text[:150]}")
+    except json.JSONDecodeError:
         return None
 
 
-# ===================== WILDBERRIES =====================
+# ===================== WB BASKET =====================
 
-def _wb_basket(product_id: str) -> tuple:
+def _wb_basket_num(vol: int) -> str:
+    """Актуальная таблица корзин WB (2025)"""
+    ranges = [
+        (143, "01"), (287, "02"), (431, "03"), (719, "04"),
+        (1007, "05"), (1061, "06"), (1115, "07"), (1169, "08"),
+        (1313, "09"), (1601, "10"), (1655, "11"), (1919, "12"),
+        (2045, "13"), (2189, "14"), (2405, "15"), (2621, "16"),
+        (2837, "17"), (3071, "18"), (3305, "19"), (3539, "20"),
+        (3773, "21"), (4007, "22"), (4241, "23"), (4475, "24"),
+        (4709, "25"), (4943, "26"), (5177, "27"), (5411, "28"),
+        (5645, "29"), (5879, "30"), (6113, "31"), (6347, "32"),
+        (6581, "33"), (6815, "34"), (7049, "35"), (7283, "36"),
+        (7517, "37"), (7751, "38"), (7985, "39"), (8219, "40"),
+        (8453, "41"), (8687, "42"), (8921, "43"), (9155, "44"),
+        (9389, "45"), (9623, "46"), (9857, "47"), (10091, "48"),
+        (10325, "49"), (10559, "50"),
+    ]
+    for limit, num in ranges:
+        if vol <= limit:
+            return num
+    # Для очень новых товаров — формула
+    basket = 18 + (vol - 2837) // 234
+    if basket > 50:
+        basket = 50
+    return f"{basket:02d}"
+
+
+def _wb_host(product_id: str) -> tuple:
     pid = int(product_id)
     vol = pid // 100000
     part = pid // 1000
-
-    ranges = [
-        (143,"01"),(287,"02"),(431,"03"),(719,"04"),
-        (1007,"05"),(1061,"06"),(1115,"07"),(1169,"08"),
-        (1313,"09"),(1601,"10"),(1655,"11"),(1919,"12"),
-        (2045,"13"),(2189,"14"),(2405,"15"),(2621,"16"),
-        (2837,"17"),
-    ]
-    basket = "18"
-    for limit, num in ranges:
-        if vol <= limit:
-            basket = num
-            break
-
+    basket = _wb_basket_num(vol)
     host = f"basket-{basket}.wbbasket.ru"
     return host, vol, part
 
 
-async def _wb_scrape(product_id: str) -> Optional[Dict[str, Any]]:
-    logger.info(f"=== WB SCRAPE START: {product_id} ===")
+# ===================== WB SCRAPE =====================
 
-    host, vol, part = _wb_basket(product_id)
+async def _wb_scrape(product_id: str) -> Optional[Dict[str, Any]]:
+    host, vol, part = _wb_host(product_id)
     base = f"https://{host}/vol{vol}/part{part}/{product_id}"
 
-    logger.info(f"WB basket: {host}, vol={vol}, part={part}")
+    logger.info(f"=== WB START: {product_id} | {host} vol={vol} part={part} ===")
 
-    # 1. Карточка товара
+    # 1. Карточка
     card = None
-    card_urls = [
-        f"{base}/info/ru/card.json",
-        f"{base}/info/card.json",
-    ]
-    for url in card_urls:
-        card = await _fetch_json(url)
+    for path in ["/info/ru/card.json", "/info/card.json"]:
+        card = await _fetch_json(f"{base}{path}")
         if card:
-            logger.info(f"WB: card.json OK")
+            logger.info("WB: card OK")
             break
 
     # 2. Цена
     price_data = None
-    price_urls = [
-        f"{base}/info/sellers.json",
-        f"{base}/info/price-history.json",
-    ]
-    for url in price_urls:
-        price_data = await _fetch_json(url)
+    for path in ["/info/sellers.json", "/info/price-history.json"]:
+        price_data = await _fetch_json(f"{base}{path}")
         if price_data:
-            logger.info(f"WB: price data OK")
+            logger.info("WB: price OK")
             break
 
-    # 3. Card API (fallback)
-    card_api_data = None
-    if not card or not price_data:
+    # 3. Card API fallback
+    api_product = None
+    if not card and not price_data:
         for dest in ["-1257786", "-5803327", "123585924", "-1029256"]:
-            for ver in ["v2", "v1"]:
-                url = (
-                    f"https://card.wb.ru/cards/{ver}/detail"
-                    f"?appType=1&curr=rub&dest={dest}&spp=30&nm={product_id}"
-                )
-                data = await _fetch_json(url)
-                if data:
-                    products = data.get("data", {}).get("products", [])
-                    if products:
-                        card_api_data = products[0]
-                        logger.info(f"WB: card API OK (dest={dest}, ver={ver})")
-                        break
-            if card_api_data:
-                break
+            url = (
+                f"https://card.wb.ru/cards/v2/detail"
+                f"?appType=1&curr=rub&dest={dest}&spp=30&nm={product_id}"
+            )
+            data = await _fetch_json(url)
+            if data:
+                prods = data.get("data", {}).get("products", [])
+                if prods:
+                    api_product = prods[0]
+                    logger.info(f"WB: card API OK dest={dest}")
+                    break
 
-    # Собираем результат
+    # Собираем данные
     title = ""
     brand = ""
     category = ""
@@ -143,46 +142,41 @@ async def _wb_scrape(product_id: str) -> Optional[Dict[str, Any]]:
     seller_name = ""
     seller_id = None
 
-    # Из card.json
     if card:
         title = card.get("imt_name", card.get("name", ""))
-        brand = card.get("selling", {}).get("brand_name", card.get("brand", ""))
+        selling = card.get("selling", {})
+        brand = selling.get("brand_name", card.get("brand", ""))
+        seller_name = selling.get("supplier_name", "")
+        sid = selling.get("supplier_id")
+        seller_id = str(sid) if sid else None
         subj = card.get("subj_name", "")
         root = card.get("subj_root_name", "")
         category = f"{root} / {subj}" if root and subj else subj
-        seller_name = card.get("selling", {}).get("supplier_name", "")
-        sid = card.get("selling", {}).get("supplier_id")
-        seller_id = str(sid) if sid else None
 
-    # Из card API
-    if card_api_data:
+    if api_product:
         if not title:
-            b = card_api_data.get("brand", "")
-            n = card_api_data.get("name", "")
-            title = f"{b} {n}".strip()
-            brand = b
+            brand = api_product.get("brand", "")
+            name = api_product.get("name", "")
+            title = f"{brand} {name}".strip()
         if not seller_name:
-            seller_name = card_api_data.get("supplier", "")
-        sid = card_api_data.get("supplierId")
-        if sid and not seller_id:
-            seller_id = str(sid)
-        rating = card_api_data.get("reviewRating", 0)
-        reviews_count = card_api_data.get("feedbacks", 0)
-
-        subj = card_api_data.get("subjectName", "")
-        parent = card_api_data.get("subjectParentName", "")
+            seller_name = api_product.get("supplier", "")
+        if not seller_id:
+            sid = api_product.get("supplierId")
+            seller_id = str(sid) if sid else None
+        rating = api_product.get("reviewRating", 0)
+        reviews_count = api_product.get("feedbacks", 0)
         if not category:
+            subj = api_product.get("subjectName", "")
+            parent = api_product.get("subjectParentName", "")
             category = f"{parent} / {subj}" if parent and subj else subj
 
-        # Цена из card API
-        for s in card_api_data.get("sizes", []):
+        for s in api_product.get("sizes", []):
             p = s.get("price", {})
             if p:
                 current_price = p.get("total", 0) / 100
                 original_price = p.get("basic", 0) / 100
                 break
 
-    # Из sellers.json / price-history.json
     if price_data and current_price == 0:
         if isinstance(price_data, dict):
             for s in price_data.get("sizes", []):
@@ -196,7 +190,6 @@ async def _wb_scrape(product_id: str) -> Optional[Dict[str, Any]]:
             if isinstance(last.get("price"), dict):
                 current_price = last["price"].get("RUB", 0) / 100
 
-    # Скидка
     discount = 0
     if original_price > current_price > 0:
         discount = round((1 - current_price / original_price) * 100, 1)
@@ -204,16 +197,20 @@ async def _wb_scrape(product_id: str) -> Optional[Dict[str, Any]]:
     image_url = f"https://{host}/vol{vol}/part{part}/{product_id}/images/big/1.webp"
 
     if not title and not current_price:
-        logger.error(f"WB: no data at all for {product_id}")
+        logger.error(f"WB: no data for {product_id}")
         return None
 
     if not title:
         title = f"Товар WB #{product_id}"
 
+    full_title = title
+    if brand and brand.lower() not in title.lower():
+        full_title = f"{brand} {title}"
+
     result = {
         "external_id": product_id,
         "marketplace": "wildberries",
-        "title": f"{brand} {title}".strip() if brand and brand.lower() not in title.lower() else title,
+        "title": full_title,
         "brand": brand,
         "category": category,
         "current_price": current_price,
@@ -227,8 +224,7 @@ async def _wb_scrape(product_id: str) -> Optional[Dict[str, Any]]:
         "url": f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
         "raw_data": {},
     }
-
-    logger.info(f"=== WB RESULT: {result['title'][:50]}, price={current_price} ===")
+    logger.info(f"=== WB OK: {full_title[:50]}, price={current_price} ===")
     return result
 
 
@@ -244,18 +240,18 @@ async def _wb_search(query: str, limit: int = 10) -> list:
             results = []
             for p in data["data"]["products"][:limit]:
                 pid = str(p.get("id", ""))
-                price_info = {}
+                pi = {}
                 for s in p.get("sizes", []):
                     pd = s.get("price", {})
                     if pd:
-                        price_info = pd
+                        pi = pd
                         break
                 results.append({
                     "external_id": pid,
                     "marketplace": "wildberries",
                     "title": f"{p.get('brand','')} {p.get('name','')}".strip(),
-                    "price": price_info.get("total", 0) / 100 if price_info.get("total") else 0,
-                    "original_price": price_info.get("basic", 0) / 100 if price_info.get("basic") else 0,
+                    "price": pi.get("total", 0) / 100 if pi.get("total") else 0,
+                    "original_price": pi.get("basic", 0) / 100 if pi.get("basic") else 0,
                     "rating": p.get("reviewRating", 0),
                     "reviews_count": p.get("feedbacks", 0),
                     "seller": p.get("supplier", ""),
@@ -304,12 +300,10 @@ async def _wb_seller(seller_id: str) -> Optional[Dict[str, Any]]:
 # ===================== OZON =====================
 
 async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
-    logger.info(f"OZON: {product_id}")
     url = f"https://www.ozon.ru/product/{product_id}/"
     html = await _fetch(url)
     if not html:
         return None
-
     try:
         soup = BeautifulSoup(html, "lxml")
         title = ""
@@ -355,8 +349,7 @@ async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
             "discount_percent": 0, "rating": rating,
             "reviews_count": reviews_count, "seller_name": "",
             "seller_id": None, "image_url": image_url,
-            "url": f"https://www.ozon.ru/product/{product_id}/",
-            "raw_data": {},
+            "url": url, "raw_data": {},
         }
     except Exception as e:
         logger.error(f"OZON error: {e}")
@@ -450,7 +443,6 @@ async def scrape_product(marketplace: str, product_id: str) -> Optional[Dict[str
     }
     func = funcs.get(marketplace)
     if not func:
-        logger.error(f"Unknown marketplace: {marketplace}")
         return None
     result = await func(product_id)
     if result:
