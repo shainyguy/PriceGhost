@@ -39,6 +39,11 @@ def setup_routers() -> Router:
     return main_router
 
 
+async def health_handler(request):
+    """Health check для Railway"""
+    return web.Response(text="OK", status=200)
+
+
 async def on_startup(bot: Bot):
     global _scheduler_task
 
@@ -46,11 +51,9 @@ async def on_startup(bot: Bot):
     logger.info("Database initialized")
 
     if config.webhook.url:
-        # СНАЧАЛА удаляем старый вебхук и чистим очередь
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Old webhook deleted, pending updates dropped")
 
-        # Ставим новый
         full = config.webhook.full_url
         await bot.set_webhook(full)
         logger.info(f"Webhook set: {full}")
@@ -106,10 +109,9 @@ def create_dispatcher() -> Dispatcher:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Логируем ВСЕ необработанные ошибки
     @dp.errors()
     async def error_handler(event, exception):
-        logger.error(f"ERROR in handler: {exception}")
+        logger.error(f"Handler error: {exception}")
         logger.error(traceback.format_exc())
         return True
 
@@ -129,11 +131,21 @@ def start_webhook():
 
     app = web.Application()
 
-    webhook_path = config.webhook.path
-    logger.info(f"Registering webhook handler on path: {webhook_path}")
+    # Health check — Railway проверяет что сервис жив
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
 
+    # Webhook
+    webhook_path = config.webhook.path
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
 
-    web.run_app(app, host=config.webhook.host, port=config.webhook.port)
+    port = config.webhook.port
+    host = config.webhook.host
+
+    logger.info(f"Starting web server on {host}:{port}")
+    logger.info(f"Webhook path: {webhook_path}")
+    logger.info(f"Health check: / and /health")
+
+    web.run_app(app, host=host, port=port)
