@@ -163,41 +163,33 @@ async def handle_target_price(message: Message, state: FSMContext):
 @router.message(Command("monitors"))
 @router.message(F.text == "📊 Мои товары")
 async def cmd_monitors(message: Message):
-    await _show_monitors(message)
-
-
-@router.callback_query(F.data == "my_monitors")
-async def cb_monitors(callback: CallbackQuery):
+    logger.info(f"MONITORS from {message.from_user.id}")
     db = await get_db()
-    monitors = await db.get_user_monitors(callback.from_user.id)
-
+    monitors = await db.get_user_monitors(message.from_user.id)
+    
     if not monitors:
-        await callback.message.edit_text(
+        await message.answer(
             "📊 <b>Мои товары</b>\n\n"
-            "Список пуст. Отправь ссылку на товар и добавь в мониторинг! 🔔",
+            "Список пуст.\n\n"
+            "Чтобы добавить товар:\n"
+            "1. Отправь ссылку на товар\n"
+            "2. Нажми кнопку 🔔 Мониторить",
             reply_markup=back_to_menu_kb(),
         )
-        await callback.answer()
         return
 
     text = f"📊 <b>Отслеживаемые товары ({len(monitors)})</b>\n\n"
-
     for i, item in enumerate(monitors, 1):
         product = item["product"]
         monitor = item["monitor"]
         title = product.title[:40] if product.title else f"Товар #{product.id}"
-
         text += f"{i}. 📦 <b>{title}</b>\n"
         text += f"   💰 {format_price(product.current_price)}"
-
         if monitor.target_price:
             text += f" | 🎯 {format_price(monitor.target_price)}"
-
         text += "\n"
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=monitors_list_kb(monitors),
+    await message.answer(text, reply_markup=monitors_list_kb(monitors)),
     )
     await callback.answer()
 
@@ -264,4 +256,5 @@ async def cb_unmonitor(callback: CallbackQuery):
         await callback.message.edit_text(
             text,
             reply_markup=monitors_list_kb(monitors),
+
         )
