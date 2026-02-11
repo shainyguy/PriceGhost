@@ -34,17 +34,18 @@ class DatabaseConfig:
 
 @dataclass
 class WebhookConfig:
-    url: str = os.getenv("WEBHOOK_URL", "").rstrip("/")
-    path: str = os.getenv("WEBHOOK_PATH", "/webhook")
-    host: str = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
-    port: int = int(os.getenv("WEB_SERVER_PORT", "8080"))
+    url: str = ""
+    path: str = "/webhook"
+    host: str = "0.0.0.0"
+    port: int = 8080
 
     def __post_init__(self):
-        # Гарантируем чистые пути
-        self.url = self.url.rstrip("/")
-        if self.path and not self.path.startswith("/"):
-            self.path = "/" + self.path
-        self.path = "/" + self.path.strip("/")
+        # Railway даёт PORT автоматически — это главный порт
+        self.port = int(os.getenv("PORT", os.getenv("WEB_SERVER_PORT", "8080")))
+        self.host = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
+        self.url = os.getenv("WEBHOOK_URL", "").rstrip("/")
+        raw_path = os.getenv("WEBHOOK_PATH", "/webhook").strip("/")
+        self.path = f"/{raw_path}"
 
     @property
     def full_url(self) -> str:
