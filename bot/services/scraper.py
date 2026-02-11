@@ -12,6 +12,56 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 
+OZON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Cache-Control": "max-age=0",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+async def _ozon_fetch(url: str) -> Optional[str]:
+    """Специальный fetch для Ozon с обходом блокировки"""
+    logger.info(f"OZON FETCH: {url[:100]}")
+    try:
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        
+        # Пробуем разные User-Agent
+        agents = [
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ]
+        
+        for ua in agents:
+            headers = {**OZON_HEADERS, "User-Agent": ua}
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers=headers,
+            ) as session:
+                async with session.get(url, ssl=ssl_ctx) as resp:
+                    logger.info(f"  OZON -> {resp.status} (UA: {ua[:30]})")
+                    if resp.status == 200:
+                        return await resp.text()
+                    elif resp.status == 403:
+                        continue
+                    else:
+                        return None
+        
+        logger.warning("OZON: all User-Agents blocked")
+        return None
+    except Exception as e:
+        logger.error(f"OZON fetch error: {e}")
+        return None
+
+
 def _get_ssl():
     return ssl.create_default_context(cafile=certifi.where())
 
@@ -300,10 +350,25 @@ async def _wb_seller(seller_id: str) -> Optional[Dict[str, Any]]:
 # ===================== OZON =====================
 
 async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
-    url = f"https://www.ozon.ru/product/{product_id}/"
-    html = await _fetch(url)
+    logger.info(f"OZON: {product_id}")
+    
+    # Пробуем разные форматы URL
+    urls = [
+        f"https://www.ozon.ru/product/{product_id}/",
+        f"https://m.ozon.ru/product/{product_id}/",
+        f"https://ozon.ru/product/{product_id}/",
+    ]
+    
+    html = None
+    for url in urls:
+        html = await _ozon_fetch(url)
+        if html:
+            break
+    
     if not html:
+        logger.error(f"OZON: blocked for {product_id}")
         return None
+
     try:
         soup = BeautifulSoup(html, "lxml")
         title = ""
@@ -313,13 +378,19 @@ async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
         rating = 0
         reviews_count = 0
 
+        # Meta tags
         mt = soup.find("meta", {"property": "og:title"})
         if mt: title = mt.get("content", "")
+        
         mp = soup.find("meta", {"property": "product:price:amount"})
         if mp:
             try: price = float(mp.get("content", "0"))
             except: pass
+        
+        mi = soup.find("meta", {"property": "og:image"})
+        if mi: image_url = mi.get("content", "")
 
+        # JSON-LD
         for s in soup.find_all("script", {"type": "application/ld+json"}):
             try:
                 j = json.loads(s.string or "{}")
@@ -328,7 +399,10 @@ async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
                     b = j.get("brand")
                     brand = b.get("name", "") if isinstance(b, dict) else ""
                     img = j.get("image", "")
-                    image_url = img[0] if isinstance(img, list) and img else (img if isinstance(img, str) else "")
+                    if isinstance(img, list) and img:
+                        image_url = image_url or img[0]
+                    elif isinstance(img, str):
+                        image_url = image_url or img
                     o = j.get("offers", {})
                     if isinstance(o, dict):
                         try: price = price or float(o.get("price", 0))
@@ -341,7 +415,28 @@ async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
                         except: pass
             except: continue
 
-        if not title and not price: return None
+        # Парсинг цены из HTML если не нашли в meta/ld
+        if price == 0:
+            price_patterns = [
+                r'"price"\s*:\s*"?(\d[\d\s]*)"?',
+                r'\"finalPrice\"\s*:\s*(\d+)',
+            ]
+            page_text = str(soup)
+            for pattern in price_patterns:
+                match = re.search(pattern, page_text)
+                if match:
+                    price_str = match.group(1).replace(" ", "")
+                    try:
+                        price = float(price_str)
+                        if price > 0:
+                            break
+                    except: pass
+
+        if not title and not price:
+            logger.error(f"OZON: no data for {product_id}")
+            return None
+
+        logger.info(f"OZON OK: {title[:40]}, price={price}")
         return {
             "external_id": product_id, "marketplace": "ozon",
             "title": title, "brand": brand, "category": "",
@@ -349,7 +444,8 @@ async def _ozon_scrape(product_id: str) -> Optional[Dict[str, Any]]:
             "discount_percent": 0, "rating": rating,
             "reviews_count": reviews_count, "seller_name": "",
             "seller_id": None, "image_url": image_url,
-            "url": url, "raw_data": {},
+            "url": f"https://www.ozon.ru/product/{product_id}/",
+            "raw_data": {},
         }
     except Exception as e:
         logger.error(f"OZON error: {e}")
@@ -468,3 +564,4 @@ async def scrape_seller(marketplace: str, seller_id: str) -> Optional[Dict[str, 
     if marketplace == "wildberries":
         return await _wb_seller(seller_id)
     return None
+
