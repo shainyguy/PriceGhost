@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import traceback
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router
@@ -45,6 +46,11 @@ async def on_startup(bot: Bot):
     logger.info("Database initialized")
 
     if config.webhook.url:
+        # СНАЧАЛА удаляем старый вебхук и чистим очередь
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Old webhook deleted, pending updates dropped")
+
+        # Ставим новый
         full = config.webhook.full_url
         await bot.set_webhook(full)
         logger.info(f"Webhook set: {full}")
@@ -100,6 +106,13 @@ def create_dispatcher() -> Dispatcher:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
+    # Логируем ВСЕ необработанные ошибки
+    @dp.errors()
+    async def error_handler(event, exception):
+        logger.error(f"ERROR in handler: {exception}")
+        logger.error(traceback.format_exc())
+        return True
+
     return dp
 
 
@@ -116,7 +129,6 @@ def start_webhook():
 
     app = web.Application()
 
-    # Регистрируем хендлер на ЧИСТЫЙ путь
     webhook_path = config.webhook.path
     logger.info(f"Registering webhook handler on path: {webhook_path}")
 
