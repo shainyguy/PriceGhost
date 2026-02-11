@@ -6,7 +6,7 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from database.db import get_db
 from config import PlanLimits
 from bot.utils.url_parser import (
-    parse_marketplace_url, is_valid_url,
+    parse_marketplace_url, resolve_short_url,
     get_marketplace_emoji, get_marketplace_name
 )
 from bot.utils.helpers import format_price, format_percent, plan_badge
@@ -16,8 +16,6 @@ from bot.keyboards.inline import (
 from bot.services.price_history import fetch_and_save_price, get_price_stats
 from bot.services.chart import generate_price_chart
 from bot.services.fake_discount import analyze_fake_discount
-from bot.services.search_cheaper import find_cheaper, format_cheaper_results
-from bot.services.seller_check import check_seller, format_seller_check
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -28,46 +26,74 @@ async def handle_url(message: Message):
     """Обработка ссылки на товар"""
     url = message.text.strip()
 
+    # Если в тексте несколько слов — ищем URL
+    if " " in url:
+        import re
+        urls = re.findall(r'https?://\S+', url)
+        if urls:
+            url = urls[0]
+        else:
+            return
+
     # Парсим URL
-    marketplace, product_id = parse_marketplace_url(url)
+    marketplace, product_id, clean_url = parse_marketplace_url(url)
+
+    # Короткая ссылка Ozon — резолвим
+    if marketplace == "ozon_short":
+        loading = await message.answer("⏳ Обрабатываю короткую ссылку...")
+        resolved = await resolve_short_url(url)
+        if resolved:
+            marketplace, product_id, clean_url = parse_marketplace_url(resolved)
+            if not marketplace:
+                await loading.edit_text(
+                    "❌ Не удалось распознать ссылку после перенаправления.\n"
+                    f"Получена: {resolved}\n\n"
+                    "Попробуйте скопировать полную ссылку на товар."
+                )
+                return
+        else:
+            await loading.edit_text(
+                "❌ Не удалось обработать короткую ссылку.\n"
+                "Попробуйте скопировать полную ссылку на товар с Ozon."
+            )
+            return
+        try:
+            await loading.delete()
+        except:
+            pass
 
     if not marketplace:
         await message.answer(
             "❌ Не удалось распознать ссылку.\n\n"
             "Поддерживаемые площадки:\n"
-            "🟣 Wildberries\n"
-            "🔵 Ozon\n"
-            "🟠 AliExpress\n"
-            "🟡 Amazon\n\n"
-            "Отправь прямую ссылку на товар.",
+            "🟣 Wildberries — wildberries.ru/catalog/...\n"
+            "🔵 Ozon — ozon.ru/product/...\n"
+            "🟠 AliExpress — aliexpress.ru/item/...\n"
+            "🟡 Amazon — amazon.com/dp/...\n\n"
+            "Скопируйте прямую ссылку на товар.",
         )
         return
 
     db = await get_db()
-    user = await db.get_user(message.from_user.id)
-
-    if not user:
-        user = await db.get_or_create_user(
-            telegram_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-        )
+    user = await db.get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+    )
 
     # Проверяем лимит
     allowed, used, limit = await db.check_and_increment_usage(message.from_user.id)
 
     if not allowed:
-        plan = user.active_plan
         await message.answer(
             f"⛔ <b>Лимит исчерпан!</b>\n\n"
-            f"Тариф: {plan_badge(plan)}\n"
+            f"Тариф: {plan_badge(user.active_plan)}\n"
             f"Проверок сегодня: {used}/{limit}\n\n"
             f"💎 Улучши план для большего количества проверок!",
             reply_markup=upgrade_kb(),
         )
         return
 
-    # Начинаем проверку
     mp_emoji = get_marketplace_emoji(marketplace)
     mp_name = get_marketplace_name(marketplace)
 
@@ -78,16 +104,19 @@ async def handle_url(message: Message):
     )
 
     # Скрапим и сохраняем
-    product_data = await fetch_and_save_price(marketplace, product_id, url)
+    product_data = await fetch_and_save_price(
+        marketplace, product_id, clean_url or url
+    )
 
     if not product_data:
         await loading_msg.edit_text(
             f"❌ Не удалось получить данные о товаре.\n\n"
+            f"{mp_emoji} {mp_name}\n\n"
             f"Возможные причины:\n"
             f"• Товар удалён или недоступен\n"
-            f"• Площадка временно не отвечает\n"
+            f"• {mp_name} блокирует запросы с серверов\n"
             f"• Некорректная ссылка\n\n"
-            f"Попробуйте позже.",
+            f"💡 Попробуйте другую ссылку или площадку.",
             reply_markup=back_to_menu_kb(),
         )
         return
@@ -103,7 +132,6 @@ async def handle_url(message: Message):
     brand = product_data.get("brand", "")
     seller = product_data.get("seller_name", "")
 
-    # Получаем статистику по истории
     stats = await get_price_stats(db_id, days=365)
 
     text = f"👻 <b>PriceGhost</b> — Результат\n\n"
@@ -128,8 +156,7 @@ async def handle_url(message: Message):
             text += f" ({reviews:,} отзывов)"
         text += "\n"
 
-    # Статистика из истории
-    if stats.get("has_data"):
+    if stats.get("has_data") and stats["records_count"] > 1:
         text += f"\n📊 <b>Статистика:</b>\n"
         text += f"├ 📉 Минимум: {format_price(stats['min_price'])}\n"
         text += f"├ 📈 Максимум: {format_price(stats['max_price'])}\n"
@@ -143,15 +170,13 @@ async def handle_url(message: Message):
             f" ({format_percent(stats['trend_percent'])})\n"
         )
 
-        # Быстрый вердикт по скидке
         if current_price <= stats["min_price"] * 1.05:
-            text += "\n🎉 <b>Отличная цена! Близко к историческому минимуму.</b>"
+            text += "\n🎉 <b>Отличная цена! Близко к минимуму.</b>"
         elif current_price >= stats["max_price"] * 0.95:
             text += "\n⚠️ <b>Цена близка к максимуму. Лучше подождать.</b>"
     else:
-        text += "\n📊 Отслеживание начато! При следующей проверке будет больше данных."
+        text += "\n📊 Отслеживание начато! Данные накопятся за несколько дней."
 
-    # Определяем план для показа кнопок
     active_plan = user.active_plan
 
     await loading_msg.edit_text(
@@ -164,7 +189,6 @@ async def handle_url(message: Message):
 
 @router.callback_query(F.data.startswith("product_"))
 async def cb_product_info(callback: CallbackQuery):
-    """Показать инфо о товаре повторно"""
     product_id = int(callback.data.replace("product_", ""))
     db = await get_db()
     product = await db.get_product(product_id)
@@ -184,20 +208,18 @@ async def cb_product_info(callback: CallbackQuery):
         f"💰 Цена: <b>{format_price(product.current_price)}</b>\n"
     )
 
-    if product.original_price and product.original_price > product.current_price:
+    if product.original_price and product.original_price > (product.current_price or 0):
         text += f"🏷 До скидки: <s>{format_price(product.original_price)}</s>\n"
 
     active_plan = user.active_plan if user else "FREE"
     await callback.message.edit_text(
-        text,
-        reply_markup=product_actions_kb(product_id, active_plan),
+        text, reply_markup=product_actions_kb(product_id, active_plan)
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("history_"))
 async def cb_price_history(callback: CallbackQuery):
-    """Показать график истории цен"""
     product_id = int(callback.data.replace("history_", ""))
     db = await get_db()
     user = await db.get_user(callback.from_user.id)
@@ -211,34 +233,30 @@ async def cb_price_history(callback: CallbackQuery):
     limits = PlanLimits.get(active_plan)
     days = limits["history_days"]
 
-    await callback.answer("📊 Генерирую график...")
+    await callback.answer("📊 Генерирую...")
 
     stats = await get_price_stats(product_id, days=days)
 
     if not stats.get("has_data") or stats["records_count"] < 2:
-        text = (
+        await callback.message.edit_text(
             f"📊 <b>История цен</b>\n\n"
             f"📦 {product.title or 'Товар'}\n\n"
-            f"Пока недостаточно данных для графика.\n"
-            f"Записей: {stats.get('records_count', 0)}\n\n"
-            f"Отслеживание начато! Данные накопятся за несколько дней."
-        )
-        await callback.message.edit_text(
-            text, reply_markup=product_actions_kb(product_id, active_plan)
+            f"Записей: {stats.get('records_count', 1)}\n"
+            f"Данные накопятся за несколько дней.\n"
+            f"Каждая проверка добавляет точку на график!",
+            reply_markup=product_actions_kb(product_id, active_plan),
         )
         return
 
-    title = product.title[:50] if product.title else "Товар"
+    title = (product.title or "Товар")[:50]
 
-    # Проверяем доступ к графику
     if not limits.get("chart") and active_plan == "FREE":
-        # Для бесплатного плана — текстовая история
         text = (
-            f"📊 <b>История цен (последние {days} дней)</b>\n\n"
+            f"📊 <b>История цен ({days} дн.)</b>\n\n"
             f"📦 {title}\n\n"
             f"💰 Сейчас: <b>{format_price(stats['current_price'])}</b>\n"
-            f"📉 Минимум: {format_price(stats['min_price'])}\n"
-            f"📈 Максимум: {format_price(stats['max_price'])}\n"
+            f"📉 Мин: {format_price(stats['min_price'])}\n"
+            f"📈 Макс: {format_price(stats['max_price'])}\n"
             f"📊 Средняя: {format_price(stats['avg_price'])}\n"
             f"📝 Записей: {stats['records_count']}\n\n"
             f"💎 Для графика нужен PRO план"
@@ -248,7 +266,6 @@ async def cb_price_history(callback: CallbackQuery):
         )
         return
 
-    # Генерируем график
     chart = await generate_price_chart(
         records=stats["records"],
         title=title,
@@ -269,10 +286,9 @@ async def cb_price_history(callback: CallbackQuery):
 
     photo = BufferedInputFile(chart.read(), filename="price_chart.png")
 
-    # Удаляем старое сообщение и отправляем фото
     try:
         await callback.message.delete()
-    except Exception:
+    except:
         pass
 
     await callback.message.answer_photo(
@@ -284,7 +300,6 @@ async def cb_price_history(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fake_"))
 async def cb_fake_discount(callback: CallbackQuery):
-    """Проверка фейковой скидки"""
     product_id = int(callback.data.replace("fake_", ""))
     db = await get_db()
     product = await db.get_product(product_id)
@@ -294,7 +309,7 @@ async def cb_fake_discount(callback: CallbackQuery):
         await callback.answer("Товар не найден", show_alert=True)
         return
 
-    await callback.answer("🔍 Анализирую скидку...")
+    await callback.answer("🔍 Анализирую...")
 
     result = await analyze_fake_discount(
         product_id=product_id,
@@ -302,35 +317,33 @@ async def cb_fake_discount(callback: CallbackQuery):
         original_price=product.original_price or 0,
     )
 
-    # Формируем ответ
-    confidence_bar = "█" * int(result["confidence"] / 10) + "░" * (10 - int(result["confidence"] / 10))
+    bar_filled = int(result["confidence"] / 10)
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
 
     text = f"🚨 <b>Детектор фейковых скидок</b>\n\n"
-    text += f"📦 {product.title[:60] if product.title else 'Товар'}\n\n"
+    text += f"📦 {(product.title or 'Товар')[:60]}\n\n"
 
     if result["is_fake"]:
-        text += f"🔴 <b>ФЕЙКОВАЯ СКИДКА</b> (уверенность: {result['confidence']}%)\n"
+        text += f"🔴 <b>ФЕЙКОВАЯ СКИДКА</b> ({result['confidence']}%)\n"
     else:
-        text += f"🟢 <b>Скидка выглядит честной</b> (уверенность: {result['confidence']}%)\n"
+        text += f"🟢 <b>Скидка честная</b> ({result['confidence']}%)\n"
 
-    text += f"[{confidence_bar}]\n\n"
+    text += f"[{bar}]\n\n"
     text += result["verdict"] + "\n"
 
     if result["details"]:
         text += "\n<b>Детали:</b>\n"
-        for detail in result["details"]:
-            text += f"  {detail}\n"
+        for d in result["details"]:
+            text += f"  {d}\n"
 
     active_plan = user.active_plan if user else "FREE"
     await callback.message.edit_text(
-        text,
-        reply_markup=product_actions_kb(product_id, active_plan),
+        text, reply_markup=product_actions_kb(product_id, active_plan)
     )
 
 
 @router.callback_query(F.data.startswith("cheaper_"))
 async def cb_find_cheaper(callback: CallbackQuery):
-    """Поиск дешевле на других площадках"""
     product_id = int(callback.data.replace("cheaper_", ""))
     db = await get_db()
     user = await db.get_user(callback.from_user.id)
@@ -346,22 +359,22 @@ async def cb_find_cheaper(callback: CallbackQuery):
     if not limits.get("search_cheaper"):
         await callback.message.edit_text(
             "🔍 <b>Поиск дешевле</b>\n\n"
-            "Эта функция доступна в тарифах PRO и PREMIUM.\n\n"
-            "💎 Улучшите план для доступа!",
+            "Доступно в PRO и PREMIUM.\n\n"
+            "💎 Улучшите план!",
             reply_markup=upgrade_kb(),
         )
         await callback.answer()
         return
 
-    await callback.answer("🔍 Ищу на других площадках...")
+    await callback.answer("🔍 Ищу...")
 
+    from bot.services.search_cheaper import find_cheaper, format_cheaper_results
     results = await find_cheaper(
         title=product.title or "",
         current_price=product.current_price or 0,
         current_marketplace=product.marketplace,
         brand=product.brand or "",
     )
-
     text = format_cheaper_results(results, product.current_price or 0)
 
     await callback.message.edit_text(
@@ -373,7 +386,6 @@ async def cb_find_cheaper(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("seller_"))
 async def cb_seller_check(callback: CallbackQuery):
-    """Проверка продавца"""
     product_id = int(callback.data.replace("seller_", ""))
     db = await get_db()
     user = await db.get_user(callback.from_user.id)
@@ -388,16 +400,15 @@ async def cb_seller_check(callback: CallbackQuery):
 
     if not limits.get("seller_check"):
         await callback.message.edit_text(
-            "🛡 <b>Проверка продавца</b>\n\n"
-            "Эта функция доступна в тарифах PRO и PREMIUM.\n\n"
-            "💎 Улучшите план для доступа!",
+            "🛡 <b>Проверка продавца</b>\n\nДоступно в PRO и PREMIUM.",
             reply_markup=upgrade_kb(),
         )
         await callback.answer()
         return
 
-    await callback.answer("🛡 Проверяю продавца...")
+    await callback.answer("🛡 Проверяю...")
 
+    from bot.services.seller_check import check_seller, format_seller_check
     result = await check_seller(
         marketplace=product.marketplace,
         seller_id=product.seller_id or "",
@@ -407,10 +418,8 @@ async def cb_seller_check(callback: CallbackQuery):
             "reviews_count": product.reviews_count,
         },
     )
-
     text = format_seller_check(result)
 
     await callback.message.edit_text(
-        text,
-        reply_markup=product_actions_kb(product_id, active_plan),
+        text, reply_markup=product_actions_kb(product_id, active_plan)
     )
