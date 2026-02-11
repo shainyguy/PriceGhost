@@ -5,6 +5,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.enums import ParseMode
+from aiogram.types import Update
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -40,8 +41,14 @@ def setup_routers() -> Router:
 
 
 async def health_handler(request):
-    """Health check для Railway"""
     return web.Response(text="OK", status=200)
+
+
+async def debug_webhook_handler(request):
+    """Ручной дебаг — логируем сырое тело запроса"""
+    body = await request.text()
+    logger.info(f"RAW WEBHOOK BODY: {body[:500]}")
+    return web.Response(text="debug ok")
 
 
 async def on_startup(bot: Bot):
@@ -52,11 +59,17 @@ async def on_startup(bot: Bot):
 
     if config.webhook.url:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Old webhook deleted, pending updates dropped")
 
         full = config.webhook.full_url
-        await bot.set_webhook(full)
+        await bot.set_webhook(full, allowed_updates=["message", "callback_query"])
         logger.info(f"Webhook set: {full}")
+
+        # ПРОВЕРЯЕМ что вебхук реально установлен
+        info = await bot.get_webhook_info()
+        logger.info(f"Webhook info URL: {info.url}")
+        logger.info(f"Webhook info pending: {info.pending_update_count}")
+        logger.info(f"Webhook info last_error: {info.last_error_message}")
+        logger.info(f"Webhook info last_error_date: {info.last_error_date}")
 
     try:
         from bot.services.monitor_scheduler import run_scheduler
@@ -65,6 +78,9 @@ async def on_startup(bot: Bot):
     except Exception as e:
         logger.error(f"Scheduler failed: {e}")
 
+    # Инфо о боте
+    me = await bot.get_me()
+    logger.info(f"Bot: @{me.username} (id={me.id})")
     logger.info("PriceGhost Bot started!")
 
 
@@ -109,11 +125,22 @@ def create_dispatcher() -> Dispatcher:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    @dp.errors()
-    async def error_handler(event, exception):
-        logger.error(f"Handler error: {exception}")
-        logger.error(traceback.format_exc())
-        return True
+    # Логируем КАЖДЫЙ входящий апдейт
+    @dp.update.outer_middleware()
+    async def log_all_updates(handler, event: Update, data):
+        logger.info(f">>> INCOMING UPDATE: type={event.event_type}, id={event.update_id}")
+        if event.message:
+            logger.info(f"    Message from {event.message.from_user.id}: {event.message.text}")
+        if event.callback_query:
+            logger.info(f"    Callback from {event.callback_query.from_user.id}: {event.callback_query.data}")
+        try:
+            result = await handler(event, data)
+            logger.info(f"    Handled OK")
+            return result
+        except Exception as e:
+            logger.error(f"    HANDLER ERROR: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
     return dp
 
@@ -131,12 +158,11 @@ def start_webhook():
 
     app = web.Application()
 
-    # Health check — Railway проверяет что сервис жив
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
 
-    # Webhook
     webhook_path = config.webhook.path
+
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_handler.register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
@@ -144,8 +170,6 @@ def start_webhook():
     port = config.webhook.port
     host = config.webhook.host
 
-    logger.info(f"Starting web server on {host}:{port}")
-    logger.info(f"Webhook path: {webhook_path}")
-    logger.info(f"Health check: / and /health")
+    logger.info(f"Server: {host}:{port} | Webhook: {webhook_path}")
 
     web.run_app(app, host=host, port=port)
