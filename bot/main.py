@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import traceback
 from aiohttp import web
 
@@ -7,7 +8,6 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.enums import ParseMode
 from aiogram.types import Update
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from config import config
 from database.db import get_db
@@ -41,14 +41,20 @@ def setup_routers() -> Router:
 
 
 async def health_handler(request):
-    return web.Response(text="OK", status=200)
+    return web.Response(text="OK")
 
 
-async def debug_webhook_handler(request):
-    """Ручной дебаг — логируем сырое тело запроса"""
-    body = await request.text()
-    logger.info(f"RAW WEBHOOK BODY: {body[:500]}")
-    return web.Response(text="debug ok")
+async def run_health_server():
+    """Мини HTTP-сервер — Railway не убьёт контейнер"""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health server started on port {port}")
 
 
 async def on_startup(bot: Bot):
@@ -57,28 +63,16 @@ async def on_startup(bot: Bot):
     db = await get_db()
     logger.info("Database initialized")
 
-    if config.webhook.url:
-        await bot.delete_webhook(drop_pending_updates=True)
-
-        full = config.webhook.full_url
-        await bot.set_webhook(full, allowed_updates=["message", "callback_query"])
-        logger.info(f"Webhook set: {full}")
-
-        # ПРОВЕРЯЕМ что вебхук реально установлен
-        info = await bot.get_webhook_info()
-        logger.info(f"Webhook info URL: {info.url}")
-        logger.info(f"Webhook info pending: {info.pending_update_count}")
-        logger.info(f"Webhook info last_error: {info.last_error_message}")
-        logger.info(f"Webhook info last_error_date: {info.last_error_date}")
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook deleted, polling mode")
 
     try:
         from bot.services.monitor_scheduler import run_scheduler
         _scheduler_task = asyncio.create_task(run_scheduler(bot, interval_hours=3))
-        logger.info("Monitor scheduler started")
+        logger.info("Scheduler started")
     except Exception as e:
         logger.error(f"Scheduler failed: {e}")
 
-    # Инфо о боте
     me = await bot.get_me()
     logger.info(f"Bot: @{me.username} (id={me.id})")
     logger.info("PriceGhost Bot started!")
@@ -86,24 +80,18 @@ async def on_startup(bot: Bot):
 
 async def on_shutdown(bot: Bot):
     global _scheduler_task
-
     if _scheduler_task:
         _scheduler_task.cancel()
         try:
             await _scheduler_task
         except asyncio.CancelledError:
             pass
-
     try:
         db = await get_db()
         await db.close()
     except Exception:
         pass
-
-    if config.webhook.url:
-        await bot.delete_webhook()
-
-    logger.info("PriceGhost Bot stopped!")
+    logger.info("Bot stopped")
 
 
 def create_bot() -> Bot:
@@ -125,51 +113,24 @@ def create_dispatcher() -> Dispatcher:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Логируем КАЖДЫЙ входящий апдейт
     @dp.update.outer_middleware()
-    async def log_all_updates(handler, event: Update, data):
-        logger.info(f">>> INCOMING UPDATE: type={event.event_type}, id={event.update_id}")
-        if event.message:
-            logger.info(f"    Message from {event.message.from_user.id}: {event.message.text}")
-        if event.callback_query:
-            logger.info(f"    Callback from {event.callback_query.from_user.id}: {event.callback_query.data}")
+    async def log_updates(handler, event: Update, data):
+        logger.info(f"UPDATE {event.update_id}: {event.event_type}")
         try:
-            result = await handler(event, data)
-            logger.info(f"    Handled OK")
-            return result
+            return await handler(event, data)
         except Exception as e:
-            logger.error(f"    HANDLER ERROR: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"HANDLER ERROR: {e}\n{traceback.format_exc()}")
             raise
 
     return dp
 
 
 async def start_polling():
+    # Health сервер для Railway
+    await run_health_server()
+
     bot = create_bot()
     dp = create_dispatcher()
     await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Starting polling...")
     await dp.start_polling(bot)
-
-
-def start_webhook():
-    bot = create_bot()
-    dp = create_dispatcher()
-
-    app = web.Application()
-
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-
-    webhook_path = config.webhook.path
-
-    webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_handler.register(app, path=webhook_path)
-    setup_application(app, dp, bot=bot)
-
-    port = config.webhook.port
-    host = config.webhook.host
-
-    logger.info(f"Server: {host}:{port} | Webhook: {webhook_path}")
-
-    web.run_app(app, host=host, port=port)
