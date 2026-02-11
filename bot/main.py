@@ -17,7 +17,6 @@ _scheduler_task = None
 
 
 def setup_routers() -> Router:
-    """Собираем все роутеры здесь, не в __init__"""
     main_router = Router()
 
     from bot.handlers.admin import router as admin_router
@@ -46,9 +45,9 @@ async def on_startup(bot: Bot):
     logger.info("Database initialized")
 
     if config.webhook.url:
-        webhook_url = f"{config.webhook.url}{config.webhook.path}"
-        await bot.set_webhook(webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
+        full = config.webhook.full_url
+        await bot.set_webhook(full)
+        logger.info(f"Webhook set: {full}")
 
     try:
         from bot.services.monitor_scheduler import run_scheduler
@@ -117,8 +116,12 @@ def start_webhook():
 
     app = web.Application()
 
+    # Регистрируем хендлер на ЧИСТЫЙ путь
+    webhook_path = config.webhook.path
+    logger.info(f"Registering webhook handler on path: {webhook_path}")
+
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    webhook_handler.register(app, path=config.webhook.path)
+    webhook_handler.register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
 
     web.run_app(app, host=config.webhook.host, port=config.webhook.port)
