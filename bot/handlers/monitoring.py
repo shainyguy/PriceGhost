@@ -190,7 +190,6 @@ async def cmd_monitors(message: Message):
         text += "\n"
 
     await message.answer(text, reply_markup=monitors_list_kb(monitors)),
-    )
     await callback.answer()
 
 
@@ -258,3 +257,4 @@ async def cb_unmonitor(callback: CallbackQuery):
             reply_markup=monitors_list_kb(monitors),
 
         )
+
